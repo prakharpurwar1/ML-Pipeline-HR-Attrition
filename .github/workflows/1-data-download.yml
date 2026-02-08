@@ -38,7 +38,7 @@ jobs:
       # Step 1: Checkout repository code
       # ================================================
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
       
@@ -253,7 +253,7 @@ jobs:
       # Step 13: Upload local data as artifact (backup)
       # ================================================
       - name: Upload data artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: raw-data
           path: data/raw/
