@@ -1,0 +1,261 @@
+name: 1. Data Download to S3
+
+# When to run this workflow
+on:
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+  
+  # Automatic trigger on schedule (optional)
+  # schedule:
+  #   - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  
+  # Trigger when download script changes
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/data/data_download.py'
+      - '.github/workflows/1-data-download.yml'
+
+# Environment variables from GitHub repository settings
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+
+jobs:
+  download-data:
+    name: Download HR Attrition Dataset to S3
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write  # Required for AWS OIDC authentication
+      contents: read   # Required to checkout repository
+    
+    steps:
+      # ================================================
+      # Step 1: Checkout repository code
+      # ================================================
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+      
+      # ================================================
+      # Step 2: Setup Python environment
+      # ================================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      
+      # ================================================
+      # Step 3: Install Python dependencies
+      # ================================================
+      - name: Install dependencies
+        run: |
+          echo "Installing Python dependencies..."
+          pip install --upgrade pip
+          pip install pandas boto3
+          echo "✓ Dependencies installed"
+      
+      # ================================================
+      # Step 4: Configure AWS credentials using OIDC
+      # ================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-DataDownload
+      
+      # ================================================
+      # Step 5: Verify AWS credentials
+      # ================================================
+      - name: Verify AWS credentials
+        run: |
+          echo "Verifying AWS credentials..."
+          aws sts get-caller-identity
+          echo "✓ AWS credentials verified"
+      
+      # ================================================
+      # Step 6: Setup S3 bucket and folder structure
+      # ================================================
+      - name: Setup S3 bucket and folders
+        run: |
+          echo "Setting up S3 infrastructure..."
+          
+          # Check if bucket exists
+          if ! aws s3 ls s3://${{ env.S3_BUCKET }} 2>/dev/null; then
+            echo "Creating S3 bucket: ${{ env.S3_BUCKET }}"
+            aws s3 mb s3://${{ env.S3_BUCKET }} --region ${{ env.AWS_REGION }}
+            
+            # Enable versioning for data lineage
+            echo "Enabling versioning..."
+            aws s3api put-bucket-versioning \
+              --bucket ${{ env.S3_BUCKET }} \
+              --versioning-configuration Status=Enabled
+            
+            echo "✓ Bucket created with versioning enabled"
+          else
+            echo "✓ Bucket already exists: ${{ env.S3_BUCKET }}"
+          fi
+          
+          # Create folder structure for the project
+          echo "Creating project folder structure..."
+          aws s3api put-object --bucket ${{ env.S3_BUCKET }} --key ${{ env.PROJECT_NAME }}/data/raw/
+          aws s3api put-object --bucket ${{ env.S3_BUCKET }} --key ${{ env.PROJECT_NAME }}/data/processed/
+          aws s3api put-object --bucket ${{ env.S3_BUCKET }} --key ${{ env.PROJECT_NAME }}/models/
+          aws s3api put-object --bucket ${{ env.S3_BUCKET }} --key ${{ env.PROJECT_NAME }}/reports/
+          aws s3api put-object --bucket ${{ env.S3_BUCKET }} --key ${{ env.PROJECT_NAME }}/deployment/
+          
+          echo "✓ S3 folder structure created successfully"
+      
+      # ================================================
+      # Step 7: Create local data directory
+      # ================================================
+      - name: Create local data directory
+        run: |
+          mkdir -p data/raw
+          echo "✓ Local data directory created"
+      
+      # ================================================
+      # Step 8: Place HR dataset (from repository secrets or upload)
+      # ================================================
+      - name: Setup HR Attrition dataset
+        run: |
+          echo "Setting up HR Attrition dataset..."
+          
+          # Option 1: If dataset is in the repository
+          if [ -f "data/raw/HR_Employee_Attrition.csv" ]; then
+            echo "✓ Using dataset from repository"
+          
+          # Option 2: If dataset URL is provided as a secret
+          elif [ ! -z "${{ secrets.DATASET_URL }}" ]; then
+            echo "Downloading dataset from URL..."
+            curl -o data/raw/HR_Employee_Attrition.csv "${{ secrets.DATASET_URL }}"
+            echo "✓ Dataset downloaded from URL"
+          
+          # Option 3: Download from a known public source (if available)
+          # Note: HR dataset is typically not publicly available, this is a placeholder
+          else
+            echo "⚠ Dataset not found in repository"
+            echo "Please either:"
+            echo "  1. Add HR_Employee_Attrition.csv to data/raw/ in your repository"
+            echo "  2. Add DATASET_URL to GitHub secrets"
+            echo "  3. Upload the file manually before running this workflow"
+            
+            # Create a placeholder message
+            echo "timestamp,message" > data/raw/HR_Employee_Attrition.csv
+            echo "$(date),Please upload actual HR dataset" >> data/raw/HR_Employee_Attrition.csv
+            
+            echo "⚠ Created placeholder file - Replace with actual dataset"
+          fi
+      
+      # ================================================
+      # Step 9: Run data download and upload to S3
+      # ================================================
+      - name: Upload dataset to S3
+        id: upload
+        working-directory: ./
+        run: |
+          echo "Starting data upload to S3..."
+          
+          # Run the data download script with S3 upload
+          python src/data/data_download.py \
+            --bucket ${{ env.S3_BUCKET }} \
+            --project ${{ env.PROJECT_NAME }} \
+            --data-path data/raw/HR_Employee_Attrition.csv
+          
+          echo "✓ Data upload to S3 complete"
+      
+      # ================================================
+      # Step 10: Verify S3 upload
+      # ================================================
+      - name: Verify S3 upload
+        run: |
+          echo "Verifying files uploaded to S3..."
+          
+          # List files in the raw data folder
+          echo "Files in S3 raw data folder:"
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ --recursive --human-readable
+          
+          # Count files
+          FILE_COUNT=$(aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ --recursive | wc -l)
+          
+          echo ""
+          echo "✓ Found $FILE_COUNT files in S3"
+          
+          # Verify at least one file exists
+          if [ $FILE_COUNT -lt 1 ]; then
+            echo "✗ Error: No files found in S3"
+            exit 1
+          fi
+          
+          echo "✓ S3 upload verification successful"
+      
+      # ================================================
+      # Step 11: Download and display metadata
+      # ================================================
+      - name: Display dataset metadata
+        run: |
+          echo "Retrieving dataset metadata..."
+          
+          # Get the latest metadata file
+          METADATA_FILE=$(aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ | grep metadata | tail -1 | awk '{print $4}')
+          
+          if [ ! -z "$METADATA_FILE" ]; then
+            echo "Latest metadata file: $METADATA_FILE"
+            aws s3 cp s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/$METADATA_FILE - | python -m json.tool
+          else
+            echo "⚠ No metadata file found"
+          fi
+      
+      # ================================================
+      # Step 12: Create workflow summary
+      # ================================================
+      - name: Create GitHub Actions summary
+        run: |
+          echo "## HR Attrition Data Upload Summary 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Dataset uploaded successfully to S3!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Configuration Details" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| S3 Bucket | \`${{ env.S3_BUCKET }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | \`${{ env.PROJECT_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | \`$(date -u '+%Y-%m-%d %H:%M:%S UTC')\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Files in S3" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/ --recursive --human-readable >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### S3 Path" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/raw/" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Data is ready for preprocessing" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔄 Next workflow: **2. Data Preprocessing**" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 View files: [S3 Console](https://s3.console.aws.amazon.com/s3/buckets/${{ env.S3_BUCKET }}?prefix=${{ env.PROJECT_NAME }}/)" >> $GITHUB_STEP_SUMMARY
+      
+      # ================================================
+      # Step 13: Upload local data as artifact (backup)
+      # ================================================
+      - name: Upload data artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: raw-data
+          path: data/raw/
+          retention-days: 30
+        continue-on-error: true
