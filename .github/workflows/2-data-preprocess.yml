@@ -1,0 +1,305 @@
+name: 2. Data Preprocessing (SageMaker)
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+
+  # Auto-trigger after data download completes
+  workflow_run:
+    workflows: ["1. Data Download to S3"]
+    types: [completed]
+
+  # Trigger on code changes
+  push:
+    branches: [main, develop]
+    paths: ['src/data/data_preprocess.py', '.github/workflows/2-data-preprocess.yml']
+
+env:
+  # Referencing stored GitHub Variables
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+  ENDPOINT_NAME: ${{ vars.ENDPOINT_NAME }}
+  
+  # Updated to use GitHub Secrets
+  SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+jobs:
+  preprocess-data:
+    name: Run HR Attrition Preprocessing on SageMaker
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write  # Required for OIDC
+      contents: read
+
+    outputs:
+      job-name: ${{ steps.start-job.outputs.job_name }}
+      timestamp: ${{ steps.timestamp.outputs.timestamp }}
+
+    steps:
+      # ================================================================
+      # Step 1: Checkout code
+      # ================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ================================================================
+      # Step 2: Get timestamp
+      # ================================================================
+      - name: Generate timestamp
+        id: timestamp
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "Generated timestamp: $TIMESTAMP"
+
+      # ================================================================
+      # Step 3: Setup Python
+      # ================================================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # ================================================================
+      # Step 4: Install dependencies
+      # ================================================================
+      - name: Install dependencies
+        run: |
+          pip install boto3 sagemaker
+
+      # ================================================================
+      # Step 5: Configure AWS credentials
+      # ================================================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ================================================================
+      # Step 6: Upload preprocessing script to S3
+      # ================================================================
+      - name: Upload script to S3
+        run: |
+          echo "Uploading HR attrition preprocessing script to S3..."
+          
+          aws s3 cp src/data/data_preprocess.py \
+            s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/code/data_preprocess.py
+          
+          echo "✓ Script uploaded to s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/code/"
+
+      # ================================================================
+      # Step 7: Create and start SageMaker Processing Job
+      # ================================================================
+      - name: Start SageMaker Processing Job
+        id: start-job
+        run: |
+          python - <<'EOF'
+          import boto3
+          import json
+          import os
+          
+          # Configuration
+          timestamp = "${{ steps.timestamp.outputs.timestamp }}"
+          job_name = f"${{ env.PROJECT_NAME }}-preprocess-{timestamp}"
+          
+          # Create SageMaker client
+          sagemaker = boto3.client('sagemaker', region_name='${{ env.AWS_REGION }}')
+          
+          # Define processing job
+          response = sagemaker.create_processing_job(
+              ProcessingJobName=job_name,
+              RoleArn='${{ env.SAGEMAKER_ROLE_ARN }}',
+              ProcessingInputs=[
+                  {
+                      'InputName': 'code',
+                      'S3Input': {
+                          'S3Uri': 's3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/code/data_preprocess.py',
+                          'LocalPath': '/opt/ml/processing/input/code',
+                          'S3DataType': 'S3Prefix',
+                          'S3InputMode': 'File'
+                      }
+                  }
+              ],
+              ProcessingOutputConfig={
+                  'Outputs': [
+                      {
+                          'OutputName': 'processed_data',
+                          'S3Output': {
+                              'S3Uri': f"s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/",
+                              'LocalPath': '/opt/ml/processing/output',
+                              'S3UploadMode': 'EndOfJob'
+                          }
+                      }
+                  ]
+              },
+              ProcessingResources={
+                  'ClusterConfig': {
+                      'InstanceCount': 1,
+                      'InstanceType': 'ml.t3.medium',
+                      'VolumeSizeInGB': 10
+                  }
+              },
+              AppSpecification={
+                  'ImageUri': '763104351884.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/pytorch-training:2.0.0-cpu-py310',
+                  'ContainerEntrypoint': [
+                      'python3',
+                      '/opt/ml/processing/input/code/data_preprocess.py',
+                      '--bucket', '${{ env.S3_BUCKET }}',
+                      '--prefix', '${{ env.PROJECT_NAME }}',
+                      '--output-path', '/opt/ml/processing/output'
+                  ]
+              },
+              StoppingCondition={
+                  'MaxRuntimeInSeconds': 3600
+              },
+              Tags=[
+                  {'Key': 'Project', 'Value': 'HR-Attrition'},
+                  {'Key': 'Stage', 'Value': 'Preprocessing'},
+                  {'Key': 'Timestamp', 'Value': timestamp}
+              ]
+          )
+          
+          print(f"✓ SageMaker Processing Job started: {job_name}")
+          print(f"  Status: {response['ProcessingJobArn']}")
+          
+          # Set output
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"job_name={job_name}\n")
+          
+          EOF
+
+      # ================================================================
+      # Step 8: Wait for job completion
+      # ================================================================
+      - name: Wait for Processing Job
+        run: |
+          python - <<'EOF'
+          import boto3
+          import time
+          
+          job_name = "${{ steps.start-job.outputs.job_name }}"
+          
+          sagemaker = boto3.client('sagemaker', region_name='${{ env.AWS_REGION }}')
+          
+          print(f"Waiting for job: {job_name}")
+          print("This may take 5-10 minutes...")
+          
+          while True:
+              response = sagemaker.describe_processing_job(
+                  ProcessingJobName=job_name
+              )
+              
+              status = response['ProcessingJobStatus']
+              print(f"  Status: {status}")
+              
+              if status == 'Completed':
+                  print("\n✓ Processing job completed successfully!")
+                  break
+              elif status in ['Failed', 'Stopped']:
+                  failure_reason = response.get('FailureReason', 'Unknown')
+                  print(f"\n✗ Processing job failed: {failure_reason}")
+                  exit(1)
+              
+              time.sleep(30)  # Check every 30 seconds
+          
+          EOF
+
+      # ================================================================
+      # Step 9: Verify outputs in S3
+      # ================================================================
+      - name: Verify processed data
+        run: |
+          echo "Verifying processed HR attrition data in S3..."
+          
+          # List processed data files
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ \
+            --recursive \
+            --human-readable
+          
+          # Count NPZ files
+          NPZ_COUNT=$(aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ \
+            --recursive | grep -c ".npz" || true)
+          
+          echo "Found $NPZ_COUNT .npz file(s)"
+          
+          if [ $NPZ_COUNT -lt 1 ]; then
+            echo "✗ No processed data files found!"
+            exit 1
+          fi
+          
+          echo "✓ Processed data verified"
+
+      # ================================================================
+      # Step 10: Display preprocessing metadata
+      # ================================================================
+      - name: Display preprocessing metadata
+        run: |
+          echo "Retrieving preprocessing metadata..."
+          
+          # Get the latest metadata file
+          METADATA_FILE=$(aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ | grep "preprocessing_metadata" | tail -1 | awk '{print $4}')
+          
+          if [ ! -z "$METADATA_FILE" ]; then
+            echo "Latest metadata file: $METADATA_FILE"
+            aws s3 cp s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/$METADATA_FILE - | python -m json.tool
+          else
+            echo "⚠ No metadata file found"
+          fi
+
+      # ================================================================
+      # Step 11: Create summary
+      # ================================================================
+      - name: Create GitHub Actions summary
+        run: |
+          echo "## HR Attrition Data Preprocessing Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Job Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Job Name: \`${{ steps.start-job.outputs.job_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Timestamp: \`${{ steps.timestamp.outputs.timestamp }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Instance: \`ml.t3.medium\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Region: \`${{ env.AWS_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Project: \`${{ env.PROJECT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "**Features Created:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Age groups (18-30, 31-40, 41-50, 51-60, 60+)" >> $GITHUB_STEP_SUMMARY
+          echo "- Tenure buckets (<2, 2-5, 6-10, 10+ years)" >> $GITHUB_STEP_SUMMARY
+          echo "- Satisfaction × Overtime interaction" >> $GITHUB_STEP_SUMMARY
+          echo "- Years in current role percentage" >> $GITHUB_STEP_SUMMARY
+          echo "- High tenure satisfied flag" >> $GITHUB_STEP_SUMMARY
+          echo "- Income-experience ratio" >> $GITHUB_STEP_SUMMARY
+          echo "- Work-life balance flags" >> $GITHUB_STEP_SUMMARY
+          echo "- Long commute flag" >> $GITHUB_STEP_SUMMARY
+          echo "- Low salary hike flag" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "**Processed Files in S3:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/ --recursive --human-readable >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "**S3 Locations:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Processed Data: \`s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/data/processed/\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Scalers: \`s3://${{ env.S3_BUCKET }}/${{ env.PROJECT_NAME }}/models/scalers/\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Data preprocessing complete" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔄 Next workflow: **3. Model Training**" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 View files: [S3 Console](https://s3.console.aws.amazon.com/s3/buckets/${{ env.S3_BUCKET }}?prefix=${{ env.PROJECT_NAME }}/data/processed/)" >> $GITHUB_STEP_SUMMARY
+
+      # ================================================================
+      # Step 12: Trigger training workflow (optional)
+      # ================================================================
+      - name: Next step
+        if: success()
+        run: |
+          echo "✓ Preprocessing complete!"
+          echo ""
+          echo "Next: Manually trigger '3. Model Training' workflow"
+          echo "Or it will auto-trigger if configured"
